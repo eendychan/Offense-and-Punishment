@@ -18,7 +18,7 @@ This is a server-only mod. A server cannot draw a custom overlay directly above 
 
 ## Build
 
-The GitHub Actions workflow builds the mod automatically. It uses Java 25 and Gradle 9.6.0.
+The GitHub Actions workflow builds the mod automatically. It uses Java 25 and Gradle 9.8.0.
 
 The output JAR is uploaded as an Actions artifact named `offense-and-punishment`.
 
