@@ -12,6 +12,7 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import static net.minecraft.commands.Commands.argument;
 import static net.minecraft.commands.Commands.literal;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.permissions.Permissions;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
@@ -196,7 +197,7 @@ public final class OffenseAndPunishment implements ModInitializer {
     private static void registerCommands() {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(literal("punishment_time")
-                .requires(source -> source.hasPermission(2))
+                .requires(source -> source.permissions().hasPermission(Permissions.COMMANDS_MODERATOR))
                 .then(argument("seconds", IntegerArgumentType.integer(1, 2_147_483))
                     .executes(context -> {
                         int seconds = IntegerArgumentType.getInteger(context, "seconds");
@@ -208,7 +209,7 @@ public final class OffenseAndPunishment implements ModInitializer {
                     })));
 
             dispatcher.register(literal("punishment_hp")
-                .requires(source -> source.hasPermission(2))
+                .requires(source -> source.permissions().hasPermission(Permissions.COMMANDS_MODERATOR))
                 .then(argument("amount", IntegerArgumentType.integer(1, 1024))
                     .executes(context -> {
                         int amount = IntegerArgumentType.getInteger(context, "amount");
