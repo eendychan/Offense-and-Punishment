@@ -7,6 +7,10 @@ import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import static net.minecraft.commands.Commands.argument;
+import static net.minecraft.commands.Commands.literal;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.network.chat.Component;
@@ -29,9 +33,11 @@ public final class OffenseAndPunishment implements ModInitializer {
     public static final String MOD_ID = "offense_and_punishment";
     private static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
-    private static final double PENALTY_PER_KILL = 2.0;
     private static final double MINIMUM_MAX_HEALTH = 2.0;
-    private static final long RECOVERY_INTERVAL_MS = 3L * 60L * 60L * 1000L;
+    private static final int DEFAULT_PUNISHMENT_HP = 2;
+    private static final int DEFAULT_PUNISHMENT_TIME_SECONDS = 30 * 60;
+    private static int punishmentHp = DEFAULT_PUNISHMENT_HP;
+    private static int punishmentTimeSeconds = DEFAULT_PUNISHMENT_TIME_SECONDS;
     private static final long TICK_INTERVAL = 20L;
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -40,6 +46,7 @@ public final class OffenseAndPunishment implements ModInitializer {
     private static final Map<UUID, PlayerData> PLAYERS = new HashMap<>();
     private static MinecraftServer currentServer;
     private static Path dataFile;
+    private static Path configFile;
     private static long tickCounter;
 
     @Override
@@ -47,11 +54,15 @@ public final class OffenseAndPunishment implements ModInitializer {
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             currentServer = server;
             dataFile = server.getWorldPath(LevelResource.ROOT).resolve("offense_and_punishment.json");
+            configFile = server.getWorldPath(LevelResource.ROOT).resolve("offense_and_punishment_config.json");
+            loadConfig();
             loadData();
             LOGGER.info("Offense and Punishment data loaded.");
         });
 
-        ServerLifecycleEvents.SERVER_STOPPING.register(server -> saveData());
+        ServerLifecycleEvents.SERVER_STOPPING.register(server -> { saveData(); saveConfig(); });
+
+        registerCommands();
 
         // A non-lethal hit on a player resets the attacker's recovery timer.
         // AFTER_DAMAGE also fires when a shield blocks the hit.
@@ -74,12 +85,11 @@ public final class OffenseAndPunishment implements ModInitializer {
             data.lastPlayerHitAt = System.currentTimeMillis();
 
             double availablePenalty = Math.max(0.0, data.originalMaxHealth - MINIMUM_MAX_HEALTH);
-            int maxPenalties = (int) Math.floor((availablePenalty + 0.0001) / PENALTY_PER_KILL);
-            if (data.penalties < maxPenalties) {
-                data.penalties++;
+            if (data.missingHealth + 0.0001 < availablePenalty) {
+                data.missingHealth = Math.min(availablePenalty, data.missingHealth + punishmentHp);
                 applyMaxHealth(killer, data);
                 killer.sendSystemMessage(
-                    Component.literal("§cУбийство игрока: максимальное здоровье −2 HP."),
+                    Component.literal("§cУбийство игрока: максимальное здоровье −" + punishmentHp + " HP."),
                     true
                 );
             } else {
@@ -122,7 +132,7 @@ public final class OffenseAndPunishment implements ModInitializer {
 
         double newMaximum = Math.max(
             MINIMUM_MAX_HEALTH,
-            data.originalMaxHealth - data.penalties * PENALTY_PER_KILL
+            data.originalMaxHealth - data.missingHealth
         );
         attribute.setBaseValue(newMaximum);
 
@@ -132,21 +142,25 @@ public final class OffenseAndPunishment implements ModInitializer {
     }
 
     private static void updateRecovery(ServerPlayer player, PlayerData data, long now) {
-        if (data.penalties <= 0 || data.lastPlayerHitAt <= 0L) return;
+        if (data.missingHealth <= 0.0001 || data.lastPlayerHitAt <= 0L) return;
 
         long elapsed = now - data.lastPlayerHitAt;
-        if (elapsed < RECOVERY_INTERVAL_MS) return;
+        long recoveryIntervalMs = punishmentTimeSeconds * 1000L;
+        if (elapsed < recoveryIntervalMs) return;
 
-        long completedIntervals = elapsed / RECOVERY_INTERVAL_MS;
-        int recovered = (int) Math.min(data.penalties, completedIntervals);
-        if (recovered <= 0) return;
+        long completedIntervals = elapsed / recoveryIntervalMs;
+        int intervalsToApply = (int) Math.min(
+            Math.ceil(data.missingHealth / punishmentHp), completedIntervals);
+        if (intervalsToApply <= 0) return;
 
-        data.penalties -= recovered;
-        data.lastPlayerHitAt += recovered * RECOVERY_INTERVAL_MS;
+        double recoveredHealth = Math.min(data.missingHealth, (double) intervalsToApply * punishmentHp);
+        data.missingHealth = Math.max(0.0, data.missingHealth - recoveredHealth);
+        data.lastPlayerHitAt += intervalsToApply * recoveryIntervalMs;
 
         applyMaxHealth(player, data);
 
-        if (data.penalties == 0) {
+        if (data.missingHealth <= 0.0001) {
+            data.missingHealth = 0.0;
             data.lastPlayerHitAt = 0L;
             player.sendSystemMessage(
                 Component.literal("§aМаксимальное здоровье полностью восстановлено."),
@@ -154,7 +168,7 @@ public final class OffenseAndPunishment implements ModInitializer {
             );
         } else {
             player.sendSystemMessage(
-                Component.literal("§aВосстановлено максимальное здоровье: +" + (recovered * 2) + " HP."),
+                Component.literal("§aВосстановлено максимальное здоровье: +" + recoveredHealth + " HP."),
                 true
             );
         }
@@ -162,10 +176,11 @@ public final class OffenseAndPunishment implements ModInitializer {
     }
 
     private static void updateActionbar(ServerPlayer player, PlayerData data, long now) {
-        if (data.penalties <= 0 || data.lastPlayerHitAt <= 0L) return;
+        if (data.missingHealth <= 0.0001 || data.lastPlayerHitAt <= 0L) return;
 
         long elapsed = Math.max(0L, now - data.lastPlayerHitAt);
-        long remaining = RECOVERY_INTERVAL_MS - (elapsed % RECOVERY_INTERVAL_MS);
+        long recoveryIntervalMs = punishmentTimeSeconds * 1000L;
+        long remaining = recoveryIntervalMs - (elapsed % recoveryIntervalMs);
         long totalSeconds = (remaining + 999L) / 1000L;
         long hours = totalSeconds / 3600L;
         long minutes = (totalSeconds % 3600L) / 60L;
@@ -173,9 +188,75 @@ public final class OffenseAndPunishment implements ModInitializer {
 
         String timer = String.format("%02d:%02d:%02d", hours, minutes, seconds);
         player.sendSystemMessage(
-            Component.literal("§7До восстановления +2 HP: §f" + timer),
+            Component.literal("§7До восстановления +" + punishmentHp + " HP: §f" + timer),
             true
         );
+    }
+
+    private static void registerCommands() {
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+            dispatcher.register(literal("punishment_time")
+                .requires(source -> source.hasPermission(2))
+                .then(argument("seconds", IntegerArgumentType.integer(1, 2_147_483))
+                    .executes(context -> {
+                        int seconds = IntegerArgumentType.getInteger(context, "seconds");
+                        punishmentTimeSeconds = seconds;
+                        saveConfig();
+                        context.getSource().sendSuccess(
+                            () -> Component.literal("Время восстановления установлено: " + seconds + " сек."), true);
+                        return 1;
+                    })));
+
+            dispatcher.register(literal("punishment_hp")
+                .requires(source -> source.hasPermission(2))
+                .then(argument("amount", IntegerArgumentType.integer(1, 1024))
+                    .executes(context -> {
+                        int amount = IntegerArgumentType.getInteger(context, "amount");
+                        punishmentHp = amount;
+                        if (currentServer != null) {
+                            for (ServerPlayer player : currentServer.getPlayerList().getPlayers()) {
+                                PlayerData data = getOrCreate(player);
+                                applyMaxHealth(player, data);
+                            }
+                        }
+                        saveConfig();
+                        saveData();
+                        context.getSource().sendSuccess(
+                            () -> Component.literal("Размер наказания и восстановления установлен: " + amount + " HP."), true);
+                        return 1;
+                    })));
+        });
+    }
+
+    private static void loadConfig() {
+        if (configFile == null || !Files.exists(configFile)) return;
+        try (Reader reader = Files.newBufferedReader(configFile)) {
+            ModConfig config = GSON.fromJson(reader, ModConfig.class);
+            if (config == null) return;
+            if (config.punishmentHp >= 1 && config.punishmentHp <= 1024) {
+                punishmentHp = config.punishmentHp;
+            }
+            if (config.punishmentTimeSeconds >= 1) {
+                punishmentTimeSeconds = config.punishmentTimeSeconds;
+            }
+        } catch (Exception exception) {
+            LOGGER.error("Could not load Offense and Punishment config; using defaults.", exception);
+        }
+    }
+
+    private static void saveConfig() {
+        if (configFile == null) return;
+        try {
+            Files.createDirectories(configFile.getParent());
+            ModConfig config = new ModConfig();
+            config.punishmentHp = punishmentHp;
+            config.punishmentTimeSeconds = punishmentTimeSeconds;
+            try (Writer writer = Files.newBufferedWriter(configFile)) {
+                GSON.toJson(config, writer);
+            }
+        } catch (Exception exception) {
+            LOGGER.error("Could not save Offense and Punishment config.", exception);
+        }
     }
 
     private static void loadData() {
@@ -188,7 +269,13 @@ public final class OffenseAndPunishment implements ModInitializer {
 
             for (Map.Entry<String, PlayerData> entry : loaded.entrySet()) {
                 try {
-                    PLAYERS.put(UUID.fromString(entry.getKey()), entry.getValue());
+                    PlayerData data = entry.getValue();
+                    // Migrate player data saved by the first version, which stored a count of 2-HP penalties.
+                    if (data.missingHealth <= 0.0001 && data.penalties > 0) {
+                        data.missingHealth = data.penalties * 2.0;
+                        data.penalties = 0;
+                    }
+                    PLAYERS.put(UUID.fromString(entry.getKey()), data);
                 } catch (IllegalArgumentException ignored) {
                     LOGGER.warn("Skipping invalid player UUID in saved data: {}", entry.getKey());
                 }
@@ -214,8 +301,16 @@ public final class OffenseAndPunishment implements ModInitializer {
         }
     }
 
+    private static final class ModConfig {
+        int punishmentHp = DEFAULT_PUNISHMENT_HP;
+        int punishmentTimeSeconds = DEFAULT_PUNISHMENT_TIME_SECONDS;
+    }
+
     private static final class PlayerData {
         double originalMaxHealth = 20.0;
+        // Actual missing maximum-health points; this keeps old penalties stable if the admin changes punishment_hp.
+        double missingHealth = 0.0;
+        // Legacy field retained only to migrate data created by the earlier build.
         int penalties = 0;
         long lastPlayerHitAt = 0L;
     }
